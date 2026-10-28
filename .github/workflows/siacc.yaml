@@ -67,7 +67,7 @@ jobs:
           DRY_RUN: ${{ github.event.inputs.dry_run || 'false' }}
           WORKERS: ${{ vars.WORKERS || '5' }}
           VERIFY_SSL: ${{ vars.VERIFY_SSL || 'true' }}
-        run: python siacc_bot.py
+        run: python main.py
 
       - name: Upload scraped output
         if: always()
