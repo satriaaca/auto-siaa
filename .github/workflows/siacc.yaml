@@ -2,7 +2,7 @@ name: SIACC Auto Poster
 
 on:
   schedule:
-    # cron runs in UTC; WITA = UTC+8
+    # cron berjalan dalam UTC; WITA = UTC+8
     - cron: "0 0 * * *"   # 08:00 WITA
     - cron: "0 8 * * *"   # 16:00 WITA
   workflow_dispatch:
@@ -13,10 +13,10 @@ on:
         options: [Draft, Post]
         default: Draft
       max_articles:
-        description: "Max articles this run"
+        description: "Maksimal artikel per run"
         default: "30"
       dry_run:
-        description: "Scrape only, don't post"
+        description: "Scrape saja, jangan posting"
         type: boolean
         default: false
 
@@ -25,12 +25,21 @@ concurrency:
   cancel-in-progress: false
 
 permissions:
-  contents: write   # needed to commit state/posted_urls.json
+  contents: write   # untuk commit state/posted_urls.json
 
 jobs:
   run:
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    # Kalau SIACC_TOKEN disimpan sebagai *Environment secret*,
+    # hapus tanda # di bawah dan ganti dengan nama environment kamu:
+    # environment: production
+
+    env:
+      # Fallback ke vars supaya tetap jalan kalau token terlanjur disimpan di tab Variables.
+      # Setelah berhasil, sebaiknya pindahkan ke Secrets.
+      SIACC_TOKEN: ${{ secrets.SIACC_TOKEN || vars.SIACC_TOKEN }}
+
     steps:
       - uses: actions/checkout@v4
 
@@ -42,15 +51,23 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
+      - name: Check token
+        if: ${{ github.event.inputs.dry_run != 'true' }}
+        run: |
+          if [ -z "$SIACC_TOKEN" ]; then
+            echo "::error::SIACC_TOKEN kosong. Cek: nama secret, tab Secrets (bukan Variables/Dependabot), repo yang benar, atau Environment secret (lihat baris 'environment:')."
+            exit 1
+          fi
+          echo "Token terisi (${#SIACC_TOKEN} karakter)"
+
       - name: Run bot
         env:
-          SIACC_TOKEN: ${{ secrets.SIACC_TOKEN }}
           SIACC_MODE: ${{ github.event.inputs.mode || vars.SIACC_MODE || 'Draft' }}
           MAX_ARTICLES: ${{ github.event.inputs.max_articles || vars.MAX_ARTICLES || '30' }}
           DRY_RUN: ${{ github.event.inputs.dry_run || 'false' }}
           WORKERS: ${{ vars.WORKERS || '5' }}
           VERIFY_SSL: ${{ vars.VERIFY_SSL || 'true' }}
-        run: python main.py
+        run: python siacc_bot.py
 
       - name: Upload scraped output
         if: always()
