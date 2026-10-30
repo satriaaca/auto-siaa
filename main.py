@@ -7,6 +7,7 @@ import json
 import os
 import random
 import re
+import ssl
 import sys
 import textwrap
 import time
@@ -31,9 +32,11 @@ MAX_ARTICLES = int(os.getenv("MAX_ARTICLES", "30"))
 WORKERS = int(os.getenv("WORKERS", "5"))
 DRY_RUN = os.getenv("DRY_RUN", "false").lower() == "true"
 VERIFY_SSL = os.getenv("VERIFY_SSL", "true").lower() == "true"
+REQUIRE_IMAGE = os.getenv("REQUIRE_IMAGE", "true").lower() == "true"  # app asli: tetap posting tanpa gambar
+BROWSER_HEADERS = os.getenv("BROWSER_HEADERS", "false").lower() == "true"  # app asli: header minimal
 IGNORED_DOMAINS = [
     d.strip().lower()
-    for d in os.getenv("IGNORED_DOMAINS", "rumah123.com, lamudi.co.id, gentra.co.id").split(",")
+    for d in os.getenv("IGNORED_DOMAINS", "rumah123.com, lamudi.co.id").split(",")
     if d.strip()
 ]
 DEFAULT_QUERIES = """Tabanan+when:1d
@@ -63,14 +66,45 @@ ID_MONTHS = [
     "Juli", "Agustus", "September", "Oktober", "November", "Desember",
 ]
 
+COOKIE = os.getenv("SIACC_COOKIE", "").strip()  # optional: isi cookie browser (cf_clearance, dll)
+USER_AGENT = os.getenv(
+    "SIACC_USER_AGENT",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/156.0.0.0 Safari/537.36",
+)
+
 HEADERS = {
     "Authorization": f"Bearer {TOKEN}",
     "Accept": "application/json",
     "Referer": f"{BASE_URL}/beranda",
 }
+if BROWSER_HEADERS:
+    HEADERS.update({
+        "Accept-Language": "en-US,en;q=0.9",
+        "Origin": BASE_URL,
+        "User-Agent": USER_AGENT,
+        "sec-ch-ua": '"Not:A-Brand";v="8", "Chromium";v="156", "Google Chrome";v="156"',
+        "sec-ch-ua-mobile": "?0",
+        "sec-ch-ua-platform": '"macOS"',
+        "sec-fetch-dest": "empty",
+        "sec-fetch-mode": "cors",
+        "sec-fetch-site": "same-origin",
+    })
+if COOKIE:
+    HEADERS["Cookie"] = COOKIE
 
 if not VERIFY_SSL:
+    # sama seperti app: bypass "local issuer error" untuk urllib DAN requests (termasuk newspaper3k)
+    ssl._create_default_https_context = ssl._create_unverified_context
     requests.packages.urllib3.disable_warnings()
+    _orig_merge = requests.Session.merge_environment_settings
+
+    def _merge_no_verify(self, *a, **k):
+        settings = _orig_merge(self, *a, **k)
+        settings["verify"] = False
+        return settings
+
+    requests.Session.merge_environment_settings = _merge_no_verify
 
 
 def log(msg: str) -> None:
@@ -128,6 +162,37 @@ def clean_title_logic(title: str) -> str:
     return " ".join(title.split())
 
 
+def sanitize_pdp_compliance(text: str) -> str:
+    """Masking data pribadi sesuai prinsip UU No. 27 Tahun 2022 (UU PDP)."""
+    if not text:
+        return ""
+    s = text
+    # NIK (16 digit)
+    s = re.sub(r"\b\d{16}\b", "[NIK_DISAMARKAN]", s)
+    # Nomor HP Indonesia (+62 / 62 / 08), tidak diawali digit lain
+    s = re.sub(r"(?<!\d)(?:\+62|62|08)\d{8,12}\b", "[KONTAK_DISAMARKAN]", s)
+    # Email
+    s = re.sub(r"[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+", "[EMAIL_DISAMARKAN]", s)
+    # Nama korban / anak: case-insensitive hanya untuk frasa pemicu, nama harus berawalan huruf kapital
+    s = re.sub(
+        r"((?i:anak korban|korban asusila|korban pelecehan|korban kekerasan seksual))\s+"
+        r"([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)",
+        r"\1 [NAMA_KORBAN_DISAMARKAN]",
+        s,
+    )
+    return s
+
+
+def fetch_feed_entries(q: str) -> list:
+    url = f"https://news.google.com/rss/search?q={q}&hl=id&gl=ID&ceid=ID:id"
+    try:
+        r = requests.get(url, headers={"User-Agent": USER_AGENT}, timeout=20)
+        return feedparser.parse(r.content).entries
+    except Exception as e:
+        log(f"[RSS] gagal mengambil feed '{q}': {e}")
+        return []
+
+
 def make_driver():
     opts = Options()
     opts.add_argument("--headless=new")
@@ -172,7 +237,7 @@ def download_image(url: str, index: int) -> str:
     if not url or not url.startswith("http"):
         return ""
     try:
-        r = requests.get(url, timeout=15, verify=VERIFY_SSL)
+        r = requests.get(url, timeout=15, verify=VERIFY_SSL, headers={"User-Agent": USER_AGENT})
         if r.status_code == 200 and r.content:
             ctype = r.headers.get("Content-Type", "")
             ext = ".png" if "image/png" in ctype else ".webp" if "image/webp" in ctype else ".jpg"
@@ -211,19 +276,25 @@ def process_candidate(idx: int, cand: dict):
 
     img_path = download_image(top_image, idx)
     if not img_path:
-        log(f"skip (tanpa gambar): {cand['title'][:50]}")
-        return None
+        if REQUIRE_IMAGE:
+            log(f"skip (tanpa gambar): {cand['title'][:50]}")
+            return None
+        log(f"tanpa gambar, tetap diposting: {cand['title'][:50]}")
 
     title, pub_dt = cand["title"], cand["pub_dt"]
+    # Masking UU PDP sebelum data dikirim ke SIACC
+    full_text = sanitize_pdp_compliance(full_text)
+    summary = sanitize_pdp_compliance(summary)
+    safe_title = sanitize_pdp_compliance(title)
     how = f"{format_how_prefix(pub_dt)}\n\n{full_text}"
     log(f"OK: {title[:60]}")
     return {
         "url": cand["url"],
         "image_path": img_path,
-        "title": clean_title_logic(title),
+        "title": sanitize_pdp_compliance(clean_title_logic(title)),
         "when_": time_sekarang(),
         "what": get_sentences(full_text, 0, 2).strip() or summary.strip(),
-        "why": title,
+        "why": get_sentences(full_text, 2, 4).strip() or safe_title,
         "how": textwrap.shorten(how, width=5000, placeholder=""),
         "source_agent_report": extract_source_from_title(title) or "Media Online",
         "category": [5, int(random.choice([3, 7, 9]))],
@@ -243,10 +314,7 @@ def collect(seen_urls: set) -> list:
             if len(candidates) >= limit:
                 break
             log(f"Query: {q}")
-            feed = feedparser.parse(
-                f"https://news.google.com/rss/search?q={q}&hl=id&gl=ID&ceid=ID:id"
-            )
-            for entry in feed.entries:
+            for entry in fetch_feed_entries(q):
                 if len(candidates) >= limit:
                     break
                 title, link = entry.get("title", ""), entry.get("link", "")
@@ -321,14 +389,19 @@ def upload_attachment(record_id, image_path: str):
 def post_items(items: list, posted: list) -> tuple:
     endpoint = "/apis/feeds/draft/create" if MODE == "Draft" else "/apis/feeds/agent-report/create"
     url = f"{BASE_URL}{endpoint}?api_version=v2"
-    ok = fail = 0
+    ok = fail = streak = 0
     for i, item in enumerate(items, 1):
+        if streak >= 3:
+            log("3 kegagalan beruntun, dihentikan. Lihat artifact error_*.json untuk detail.")
+            break
         tag = f"[{i}/{len(items)}] {item['title'][:50]}"
+        payload = build_payload(item)
         try:
-            r = requests.post(url, headers=HEADERS, json=build_payload(item), verify=VERIFY_SSL, timeout=60)
+            r = requests.post(url, headers=HEADERS, json=payload, verify=VERIFY_SSL, timeout=60)
         except requests.RequestException as e:
             log(f"{tag} -> request error: {e}")
             fail += 1
+            streak += 1
             continue
 
         if r.status_code == 401:
@@ -336,10 +409,34 @@ def post_items(items: list, posted: list) -> tuple:
             save_state(posted)
             sys.exit(2)
         if r.status_code not in (200, 201):
-            log(f"{tag} -> gagal buat record: HTTP {r.status_code} {r.text[:120]}")
+            cf = bool(r.headers.get("cf-mitigated")) or "just a moment" in r.text[:300].lower()
+            log(
+                f"{tag} -> gagal buat record: HTTP {r.status_code}"
+                f"{' (Cloudflare)' if cf else ''} | {r.headers.get('Content-Type', '')} | {r.text[:500]}"
+            )
+            try:
+                OUT_DIR.mkdir(parents=True, exist_ok=True)
+                (OUT_DIR / f"error_{i}.json").write_text(
+                    json.dumps(
+                        {
+                            "url": url,
+                            "status": r.status_code,
+                            "response_headers": dict(r.headers),
+                            "response_body": r.text[:3000],
+                            "payload_sent": {**payload, "how": payload["how"][:300] + "..."},
+                        },
+                        indent=2,
+                        ensure_ascii=False,
+                    ),
+                    encoding="utf-8",
+                )
+            except Exception:
+                pass
             fail += 1
+            streak += 1
             continue
 
+        streak = 0
         # record exists now -> mark as posted so a retry never duplicates it
         posted.append(item["url"])
         save_state(posted)
@@ -351,11 +448,44 @@ def post_items(items: list, posted: list) -> tuple:
             rid = None
         if not rid:
             log(f"{tag} -> record dibuat, tapi ID tidak ditemukan (lampiran dilewati)")
+        elif not item["image_path"]:
+            log(f"{tag} -> {MODE} ID {rid}, tanpa lampiran (tidak ada gambar)")
         else:
             up_ok, up_msg = upload_attachment(rid, item["image_path"])
             log(f"{tag} -> {MODE} ID {rid}, lampiran {'OK' if up_ok else 'GAGAL ' + up_msg}")
         time.sleep(3)
     return ok, fail
+
+
+# ---------------------------------------------------------------- preflight
+def preflight() -> bool:
+    """Cek token + akses ke SIACC sebelum scraping (hemat waktu kalau diblokir)."""
+    try:
+        r = requests.get(
+            f"{BASE_URL}/apis/feeds/category?show_all=true",
+            headers=HEADERS,
+            verify=VERIFY_SSL,
+            timeout=30,
+        )
+    except requests.RequestException as e:
+        log(f"Preflight gagal (network): {e}")
+        return False
+
+    if r.status_code == 200:
+        log("Preflight OK (token & akses valid)")
+        return True
+
+    body = r.text[:300].lower()
+    if r.headers.get("cf-mitigated") or "just a moment" in body or "cloudflare" in body:
+        log(
+            f"Preflight HTTP {r.status_code}: diblokir Cloudflare. IP GitHub runner kemungkinan "
+            "ditantang. Coba isi secret SIACC_COOKIE, atau pakai self-hosted runner."
+        )
+    elif r.status_code == 401:
+        log("Preflight 401: token salah/kedaluwarsa. Perbarui SIACC_TOKEN.")
+    else:
+        log(f"Preflight HTTP {r.status_code}: {r.text[:150]}")
+    return False
 
 
 # ---------------------------------------------------------------- main
@@ -372,6 +502,9 @@ def main() -> int:
             nltk.download(pkg, quiet=True)
         except Exception:
             pass
+
+    if not DRY_RUN and not preflight():
+        return 2
 
     posted = load_state()
     log(f"Mode={MODE} dry_run={DRY_RUN} max={MAX_ARTICLES} workers={WORKERS} state={len(posted)} URL")
