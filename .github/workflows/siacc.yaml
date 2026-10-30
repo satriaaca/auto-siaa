@@ -39,6 +39,8 @@ jobs:
       # Fallback ke vars supaya tetap jalan kalau token terlanjur disimpan di tab Variables.
       # Setelah berhasil, sebaiknya pindahkan ke Secrets.
       SIACC_TOKEN: ${{ secrets.SIACC_TOKEN || vars.SIACC_TOKEN }}
+      # Opsional: string cookie dari browser (mis. cf_clearance=...; session_present=true)
+      SIACC_COOKIE: ${{ secrets.SIACC_COOKIE }}
 
     steps:
       - uses: actions/checkout@v4
@@ -67,6 +69,8 @@ jobs:
           DRY_RUN: ${{ github.event.inputs.dry_run || 'false' }}
           WORKERS: ${{ vars.WORKERS || '5' }}
           VERIFY_SSL: ${{ vars.VERIFY_SSL || 'true' }}
+          REQUIRE_IMAGE: ${{ vars.REQUIRE_IMAGE || 'false' }}
+          BROWSER_HEADERS: ${{ vars.BROWSER_HEADERS || 'false' }}
         run: python main.py
 
       - name: Upload scraped output
